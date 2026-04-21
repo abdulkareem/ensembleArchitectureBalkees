@@ -153,6 +153,44 @@ def visualize_model_comparison(
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
     x_np = np.clip(x_np * std + mean, 0, 1)
+    pred_np = (pred[:, 0].numpy() > 0.5).astype(np.float32)
+
+    rows = min(num_samples, x.shape[0])
+    fig, axes = plt.subplots(rows, 3, figsize=(12, 4 * rows))
+    if rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for i in range(rows):
+        axes[i, 0].imshow(x_np[i])
+        axes[i, 0].set_title("Input")
+        axes[i, 1].imshow(y[i, 0].cpu().numpy(), cmap="gray")
+        axes[i, 1].set_title("Ground Truth")
+        axes[i, 2].imshow(pred_np[i], cmap="gray")
+        axes[i, 2].set_title(f"{model_name} Prediction")
+        for c in range(3):
+            axes[i, c].axis("off")
+    fig.tight_layout()
+    return fig
+
+
+def visualize_predictions(
+    model: Union[torch.nn.Module, Dict[str, torch.nn.Module]],
+    loader,
+    device: torch.device,
+    num_samples: int = 5,
+    model_name: Optional[str] = None,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+):
+    force_colab_inline()
+    x, y = next(iter(loader))
+    x, y = x.to(device), y.to(device)
+
+    model_dict: Dict[str, torch.nn.Module]
+    if isinstance(model, dict):
+        model_dict = model
+    else:
+        label = model_name or model.__class__.__name__
+        model_dict = {label: model}
 
     rows = min(num_samples, x.shape[0])
     cols = 2 + len(models)
