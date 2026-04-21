@@ -18,6 +18,7 @@ from evaluate import (
     print_comparison_table,
     save_comparison_table,
     save_metrics_log,
+    visualize_model_comparison,
     visualize_predictions,
 )
 from models import ResUNetPPWrapper, TransFuse, WDFFNet
@@ -100,8 +101,20 @@ def main():
     plot_training_curves(h_wdf, "WDFFNet", output_dir=output_dir)
     plot_training_curves(h_ens, "Ensemble", output_dir=output_dir)
 
+    # Single-file side-by-side comparison for 1-2 samples across all models.
+    comparison_path = visualize_model_comparison(
+        models=models,
+        loader=test_loader,
+        device=device,
+        num_samples=2,
+        output_dir=output_dir,
+        filename="predictions_all_models.png",
+    )
+    print(f"[Saved] {comparison_path}")
+
+    # Optional per-model grids for deeper inspection.
     for name, model in models.items():
-        visualize_predictions(model, test_loader, device, num_samples=3, model_name=name, output_dir=output_dir)
+        visualize_predictions(model, test_loader, device, num_samples=2, model_name=name, output_dir=output_dir)
     plot_metrics(table, output_dir=output_dir)
 
 
