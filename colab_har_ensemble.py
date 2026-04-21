@@ -402,9 +402,7 @@ class HAREnsemble(nn.Module):
         self._printed_debug = False
 
     def _align(self, pred: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        if pred.shape[2:] != ref.shape[2:]:
-            pred = F.interpolate(pred, size=ref.shape[2:], mode="bilinear", align_corners=False)
-        return pred
+        return normalize_segmentation_output(pred, ref_shape=ref.shape[2:])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -430,6 +428,31 @@ class HAREnsemble(nn.Module):
 # =========================
 # Cell 7: Metrics + evaluation
 # =========================
+
+
+
+def normalize_segmentation_output(pred: torch.Tensor, ref_shape: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+    """Normalize model output to BCHW tensor and optionally resize to ref_shape (H, W)."""
+    if isinstance(pred, (list, tuple)):
+        if len(pred) == 0:
+            raise ValueError("Model output is empty list/tuple.")
+        pred = pred[0]
+
+    if pred.ndim == 3:
+        pred = pred.unsqueeze(1)
+    elif pred.ndim == 4 and pred.shape[1] not in (1, 2, 3) and pred.shape[-1] in (1, 2, 3):
+        # NHWC -> NCHW
+        pred = pred.permute(0, 3, 1, 2)
+    elif pred.ndim != 4:
+        raise ValueError(f"Unsupported prediction shape: {tuple(pred.shape)}")
+
+    # If model accidentally returns multi-channel logits, keep first channel for binary segmentation.
+    if pred.shape[1] > 1:
+        pred = pred[:, :1, ...]
+
+    if ref_shape is not None and pred.shape[2:] != ref_shape:
+        pred = F.interpolate(pred, size=ref_shape, mode="bilinear", align_corners=False)
+    return pred
 
 def _bin(pred: torch.Tensor, th: float = 0.5) -> torch.Tensor:
     return (pred > th).float()
@@ -461,9 +484,7 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -
     agg = {"Dice": [], "IoU": [], "Accuracy": [], "Precision": [], "Recall": [], "F1": []}
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        p = model(x)
-        if p.shape[2:] != y.shape[2:]:
-            p = F.interpolate(p, size=y.shape[2:], mode="bilinear", align_corners=False)
+        p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
         batch_metrics = compute_metrics(p, y)
         for k, v in batch_metrics.items():
             agg[k].append(v)
@@ -505,9 +526,7 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
             x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=USE_AMP):
-                p = model(x)
-                if p.shape[2:] != y.shape[2:]:
-                    p = F.interpolate(p, size=y.shape[2:], mode="bilinear", align_corners=False)
+                p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
                 loss_bce = criterion_bce(p, y)
                 loss_dice = dice_loss(p, y)
                 loss = 0.5 * loss_bce + 0.5 * loss_dice
