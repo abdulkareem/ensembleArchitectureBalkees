@@ -3,12 +3,23 @@
 import argparse
 import os
 
-import pandas as pd
 import torch
 
 from dataset import DataConfig, make_dataloaders
 from ensemble import WeightedEnsemble, train_ensemble_head
-from evaluate import build_comparison_table, evaluate_model, plot_dice_bars, plot_training_curves, visualize_predictions
+from evaluate import (
+    DEFAULT_OUTPUT_DIR,
+    build_comparison_table,
+    ensure_output_dir,
+    evaluate_model,
+    force_colab_inline,
+    plot_metrics,
+    plot_training_curves,
+    print_comparison_table,
+    save_comparison_table,
+    save_metrics_log,
+    visualize_predictions,
+)
 from models import ResUNetPPWrapper, TransFuse, WDFFNet
 from train import train_model
 from utils import measure_fps, parameter_stats, robust_load_weights, seed_everything
@@ -25,14 +36,18 @@ def parse_args():
     p.add_argument("--ensemble_epochs", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    force_colab_inline()
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
+    output_dir = ensure_output_dir(args.output_dir)
+    print(f"[Output] Saving all reports to: {output_dir}")
 
     data_cfg = DataConfig(data_dir=args.data_dir, image_size=256, batch_size=args.batch_size)
     train_loader, val_loader, test_loader = make_dataloaders(data_cfg)
@@ -74,16 +89,20 @@ def main():
 
     table = build_comparison_table(metrics, params, fps)
     print("\n=== Comparison Table ===")
-    print(table.to_string(index=False))
-    table.to_csv("comparison_table.csv", index=False)
+    print_comparison_table(table)
+    table_path = save_comparison_table(table, output_dir=output_dir, filename="comparison_table.csv")
+    print(f"[Saved] {table_path}")
+    metrics_path = save_metrics_log(metrics, output_dir=output_dir)
+    print(f"[Saved] {metrics_path}")
 
-    plot_training_curves(h_res, "ResUNet++")
-    plot_training_curves(h_trf, "TransFuse")
-    plot_training_curves(h_wdf, "WDFFNet")
-    plot_training_curves(h_ens, "Ensemble")
+    plot_training_curves(h_res, "ResUNet++", output_dir=output_dir)
+    plot_training_curves(h_trf, "TransFuse", output_dir=output_dir)
+    plot_training_curves(h_wdf, "WDFFNet", output_dir=output_dir)
+    plot_training_curves(h_ens, "Ensemble", output_dir=output_dir)
 
-    visualize_predictions(models, test_loader, device, n_samples=3)
-    plot_dice_bars(metrics)
+    for name, model in models.items():
+        visualize_predictions(model, test_loader, device, num_samples=3, model_name=name, output_dir=output_dir)
+    plot_metrics(table, output_dir=output_dir)
 
 
 if __name__ == "__main__":
