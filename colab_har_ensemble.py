@@ -37,20 +37,42 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def seed_everything(seed: int = 42) -> None:
+def _cuda_is_usable() -> bool:
+    """
+    Some Colab sessions report CUDA as available but have an invalid CUDA context.
+    Run a tiny allocation + op to verify the device is healthy before using it.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        x = torch.zeros(1, device="cuda")
+        _ = x + 1
+        return True
+    except Exception as e:
+        print(f"[WARN] CUDA reported available but failed health check: {type(e).__name__}: {e}")
+        return False
+
+
+def seed_everything(seed: int = 42, use_cuda: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if use_cuda:
+        try:
+            torch.cuda.manual_seed_all(seed)
+        except Exception as e:
+            # Keeps the script runnable on sessions where CUDA initialization is unstable.
+            print(f"[WARN] CUDA seeding failed, continuing without cuda.manual_seed_all: {type(e).__name__}: {e}")
     # deterministic=True can trigger "unable to find an engine" errors for some ops.
     # Keep training/evaluation stable via seeding while allowing cuDNN to select valid kernels.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
 
-seed_everything(42)
 FORCE_CPU = os.environ.get("FORCE_CPU", "0") == "1"
-DEVICE = torch.device("cuda" if (torch.cuda.is_available() and not FORCE_CPU) else "cpu")
+CUDA_OK = _cuda_is_usable() and not FORCE_CPU
+seed_everything(42, use_cuda=CUDA_OK)
+DEVICE = torch.device("cuda" if CUDA_OK else "cpu")
 USE_AMP = DEVICE.type == "cuda" and os.environ.get("DISABLE_AMP", "0") != "1"
 print(f"Device: {DEVICE} | AMP: {USE_AMP}")
 
