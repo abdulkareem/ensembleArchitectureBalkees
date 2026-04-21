@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 import albumentations as A
 import timm
@@ -248,6 +248,11 @@ def import_resunetplusplus_builder(resunet_repo_dir: str):
 # Cell 4: Robust weight loader
 # =========================
 
+def _canonical_key(key: str) -> str:
+    """Canonicalize parameter names to improve checkpoint/model key matching."""
+    return key.replace("_", "").lower()
+
+
 def load_partial_state_dict(model: nn.Module, ckpt_path: str, device: torch.device) -> Dict[str, int]:
     if not ckpt_path or not os.path.exists(ckpt_path):
         print(f"[WARN] Missing checkpoint: {ckpt_path}")
@@ -267,12 +272,30 @@ def load_partial_state_dict(model: nn.Module, ckpt_path: str, device: torch.devi
         clean_ckpt[nk] = v
 
     loaded, skipped = [], []
+    direct_hits = set()
     for k, v in clean_ckpt.items():
         if k in model_dict and model_dict[k].shape == v.shape:
             model_dict[k] = v
             loaded.append(k)
+            direct_hits.add(k)
         else:
             skipped.append(k)
+
+    # Fuzzy fallback for known naming drifts (e.g. backA vs back_a, trans.* prefix changes).
+    canon_to_model_keys: Dict[str, List[str]] = {}
+    for mk in model_dict.keys():
+        canon_to_model_keys.setdefault(_canonical_key(mk), []).append(mk)
+
+    for ck, cv in clean_ckpt.items():
+        if ck in direct_hits:
+            continue
+        candidates = canon_to_model_keys.get(_canonical_key(ck), [])
+        for mk in candidates:
+            if mk not in direct_hits and model_dict[mk].shape == cv.shape:
+                model_dict[mk] = cv
+                loaded.append(f"{ck} -> {mk}")
+                direct_hits.add(mk)
+                break
 
     model.load_state_dict(model_dict)
     missing_in_ckpt = [k for k in model_dict.keys() if k not in clean_ckpt]
@@ -388,6 +411,10 @@ class HAREnsemble(nn.Module):
         self.resunetpp = resunetpp.eval()
         self.wdff = wdff.eval()
         self.transfuse = transfuse.eval()
+        # Backward-compatible aliases used by some notebook cells.
+        self.r = self.resunetpp
+        self.w = self.wdff
+        self.t = self.transfuse
 
         for m in [self.resunetpp, self.wdff, self.transfuse]:
             for p in m.parameters():
@@ -438,10 +465,13 @@ def normalize_segmentation_output(pred: torch.Tensor, ref_shape: Optional[Tuple[
             raise ValueError("Model output is empty list/tuple.")
         pred = pred[0]
 
-    if pred.ndim == 3:
+    if pred.ndim == 2:
+        # HW -> BCHW
+        pred = pred.unsqueeze(0).unsqueeze(0)
+    elif pred.ndim == 3:
         pred = pred.unsqueeze(1)
-    elif pred.ndim == 4 and pred.shape[1] not in (1, 2, 3) and pred.shape[-1] in (1, 2, 3):
-        # NHWC -> NCHW
+    elif pred.ndim == 4 and pred.shape[-1] in (1, 2, 3) and pred.shape[1] not in (1, 2, 3):
+        # NHWC -> NCHW (more robust condition)
         pred = pred.permute(0, 3, 1, 2)
     elif pred.ndim != 4:
         raise ValueError(f"Unsupported prediction shape: {tuple(pred.shape)}")
@@ -511,12 +541,11 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
 
 
 def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfig):
-    criterion_bce = nn.BCELoss()
     optimizer = torch.optim.Adam(
         list(model.attn.parameters()) + list(model.weight_head.parameters()),
         lr=cfg.lr,
     )
-    scaler = GradScaler(enabled=USE_AMP)
+    scaler = GradScaler("cuda", enabled=USE_AMP)
 
     model.to(DEVICE)
     for ep in range(1, cfg.epochs + 1):
@@ -525,11 +554,12 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
         for x, y in train_loader:
             x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=USE_AMP):
+            with autocast(device_type="cuda", enabled=USE_AMP):
                 p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-                loss_bce = criterion_bce(p, y)
                 loss_dice = dice_loss(p, y)
-                loss = 0.5 * loss_bce + 0.5 * loss_dice
+            # BCE is not autocast-safe; run in full precision outside autocast.
+            loss_bce = F.binary_cross_entropy(p.float(), y.float())
+            loss = 0.5 * loss_bce + 0.5 * loss_dice
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
