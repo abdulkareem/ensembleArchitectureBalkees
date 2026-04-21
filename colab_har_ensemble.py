@@ -56,7 +56,12 @@ def _cuda_is_usable() -> bool:
 def seed_everything(seed: int = 42, use_cuda: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
+    try:
+        # torch.manual_seed may touch CUDA generators in some environments.
+        torch.manual_seed(seed)
+    except Exception as e:
+        print(f"[WARN] torch.manual_seed failed, seeding CPU default generator only: {type(e).__name__}: {e}")
+        torch.random.default_generator.manual_seed(seed)
     if use_cuda:
         try:
             torch.cuda.manual_seed_all(seed)
@@ -72,7 +77,17 @@ def seed_everything(seed: int = 42, use_cuda: bool = True) -> None:
 FORCE_CPU = os.environ.get("FORCE_CPU", "0") == "1"
 CUDA_OK = _cuda_is_usable() and not FORCE_CPU
 seed_everything(42, use_cuda=CUDA_OK)
-DEVICE = torch.device("cuda" if CUDA_OK else "cpu")
+if CUDA_OK:
+    try:
+        # One more guard: this catches sessions with a poisoned CUDA context.
+        _ = torch.tensor([1.0], device="cuda") * 2.0
+        DEVICE = torch.device("cuda")
+    except Exception as e:
+        print(f"[WARN] CUDA warmup failed, falling back to CPU: {type(e).__name__}: {e}")
+        CUDA_OK = False
+        DEVICE = torch.device("cpu")
+else:
+    DEVICE = torch.device("cpu")
 USE_AMP = DEVICE.type == "cuda" and os.environ.get("DISABLE_AMP", "0") != "1"
 print(f"Device: {DEVICE} | AMP: {USE_AMP}")
 
@@ -293,7 +308,11 @@ def load_partial_state_dict(model: nn.Module, ckpt_path: str, device: torch.devi
     model_dict = model.state_dict()
     clean_ckpt = {}
     for k, v in checkpoint.items():
-        nk = k[7:] if k.startswith("module.") else k
+        nk = k
+        for prefix in ("module.", "model.", "net.", "network."):
+            if nk.startswith(prefix):
+                nk = nk[len(prefix):]
+                break
         clean_ckpt[nk] = v
 
     loaded, skipped = [], []
@@ -324,14 +343,22 @@ def load_partial_state_dict(model: nn.Module, ckpt_path: str, device: torch.devi
 
     model.load_state_dict(model_dict)
     missing_in_ckpt = [k for k in model_dict.keys() if k not in clean_ckpt]
+    total_model_params = len(model_dict)
+    loaded_ratio = len(loaded) / max(1, total_model_params)
     print(
         f"Loaded layers: {len(loaded)} | Skipped layers: {len(skipped)} | "
-        f"Model params not found in checkpoint: {len(missing_in_ckpt)}"
+        f"Model params not found in checkpoint: {len(missing_in_ckpt)} | "
+        f"Load ratio: {loaded_ratio:.1%}"
     )
     if skipped:
         print("Skipped keys (first 20):", skipped[:20])
     if missing_in_ckpt:
         print("Missing-in-ckpt keys (first 20):", missing_in_ckpt[:20])
+    if loaded_ratio < 0.60:
+        print(
+            "[WARN] Low checkpoint load ratio detected (<60%). "
+            "This usually means architecture-key mismatch and can severely hurt Dice."
+        )
     return {"loaded": len(loaded), "skipped": len(skipped), "missing_in_ckpt": len(missing_in_ckpt)}
 
 
