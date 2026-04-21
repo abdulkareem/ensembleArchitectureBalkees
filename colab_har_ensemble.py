@@ -33,6 +33,9 @@ from torch.cuda.amp import GradScaler, autocast
 import albumentations as A
 import timm
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
 
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
@@ -145,10 +148,15 @@ class WDFFNet(nn.Module):
         self.dec_conv1 = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(inplace=True))
 
         self.out_conv = nn.Conv2d(64, num_classes, kernel_size=1)
+        self._printed_debug = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats_a = self.back_a(x)
         feats_b = self.back_b(x)
+        if not self._printed_debug:
+            print("[WDFFNet] Backbone A feature channels:", [f.shape[1] for f in feats_a])
+            print("[WDFFNet] Backbone B feature channels:", [f.shape[1] for f in feats_b])
+            self._printed_debug = True
         fused_feats = []
         for pa, pb, fa, fb, fus, oam in zip(self.proj_a, self.proj_b, feats_a, feats_b, self.fusions, self.oams):
             f = fus(pa(fa), pb(fb))
@@ -156,9 +164,16 @@ class WDFFNet(nn.Module):
             fused_feats.append(f)
 
         f1, f2, f3, f4 = fused_feats
-        d3 = self.dec_conv3(torch.cat([self.up3(f4), f3], dim=1))
-        d2 = self.dec_conv2(torch.cat([self.up2(d3), f2], dim=1))
-        d1 = self.dec_conv1(torch.cat([self.up1(d2), f1], dim=1))
+        cat3 = torch.cat([self.up3(f4), f3], dim=1)
+        d3 = self.dec_conv3(cat3)
+        cat2 = torch.cat([self.up2(d3), f2], dim=1)
+        d2 = self.dec_conv2(cat2)
+        cat1 = torch.cat([self.up1(d2), f1], dim=1)
+        if cat3.shape[1] != 256 or cat2.shape[1] != 192 or cat1.shape[1] != 128:
+            raise RuntimeError(
+                f"WDFF decoder channel mismatch: cat3={cat3.shape}, cat2={cat2.shape}, cat1={cat1.shape}"
+            )
+        d1 = self.dec_conv1(cat1)
         return torch.sigmoid(self.out_conv(d1))
 
 
@@ -180,8 +195,9 @@ class BiFusionBlock(nn.Module):
 class TransFuseSimple(nn.Module):
     """Architecture kept aligned with training notebook implementation."""
 
-    def __init__(self, num_classes: int = 1, pretrained: bool = True):
+    def __init__(self, num_classes: int = 1, pretrained: bool = True, transfuse_input_size: int = 224):
         super().__init__()
+        self.transfuse_input_size = transfuse_input_size
         self.cnn = timm.create_model("efficientnet_b0", pretrained=pretrained, features_only=True)
         self.trans = timm.create_model("mobilenetv3_large_100", pretrained=pretrained, features_only=True)
 
@@ -194,9 +210,13 @@ class TransFuseSimple(nn.Module):
         self.conv_final = nn.Conv2d(64 + 128 + 256, num_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cnn_feats = self.cnn(x)
+        native_size = x.shape[2:]
+        x_224 = F.interpolate(
+            x, size=(self.transfuse_input_size, self.transfuse_input_size), mode="bilinear", align_corners=False
+        )
+        cnn_feats = self.cnn(x_224)
         trans_feats = []
-        for t in self.trans(x):
+        for t in self.trans(x_224):
             if t.ndim == 4 and t.shape[-1] > t.shape[1]:
                 t = t.permute(0, 3, 1, 2)
             trans_feats.append(t)
@@ -208,7 +228,8 @@ class TransFuseSimple(nn.Module):
         f3_up = F.interpolate(f3, size=f1.shape[2:], mode="bilinear", align_corners=False)
         f2_up = F.interpolate(f2, size=f1.shape[2:], mode="bilinear", align_corners=False)
         out = self.conv_final(torch.cat([f3_up, f2_up, f1], dim=1))
-        return torch.sigmoid(out)
+        out = torch.sigmoid(out)
+        return F.interpolate(out, size=native_size, mode="bilinear", align_corners=False)
 
 
 def import_resunetplusplus_builder(resunet_repo_dir: str):
@@ -254,10 +275,16 @@ def load_partial_state_dict(model: nn.Module, ckpt_path: str, device: torch.devi
             skipped.append(k)
 
     model.load_state_dict(model_dict)
-    print(f"Loaded layers: {len(loaded)} | Skipped layers: {len(skipped)}")
+    missing_in_ckpt = [k for k in model_dict.keys() if k not in clean_ckpt]
+    print(
+        f"Loaded layers: {len(loaded)} | Skipped layers: {len(skipped)} | "
+        f"Model params not found in checkpoint: {len(missing_in_ckpt)}"
+    )
     if skipped:
         print("Skipped keys (first 20):", skipped[:20])
-    return {"loaded": len(loaded), "skipped": len(skipped)}
+    if missing_in_ckpt:
+        print("Missing-in-ckpt keys (first 20):", missing_in_ckpt[:20])
+    return {"loaded": len(loaded), "skipped": len(skipped), "missing_in_ckpt": len(missing_in_ckpt)}
 
 
 # =========================
@@ -273,10 +300,10 @@ class KvasirDataset(Dataset):
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.2),
                 A.RandomRotate90(p=0.2),
-                A.Normalize(),
+                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ])
         else:
-            self.tf = A.Compose([A.Resize(size, size), A.Normalize()])
+            self.tf = A.Compose([A.Resize(size, size), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
 
     def __len__(self) -> int:
         return len(self.df)
@@ -288,7 +315,9 @@ class KvasirDataset(Dataset):
         mask = np.expand_dims(mask, -1)
         out = self.tf(image=img, mask=mask)
         x = out["image"].astype("float32").transpose(2, 0, 1)
-        y = (out["mask"].astype("float32") / 255.0).transpose(2, 0, 1)
+        y = (out["mask"].astype("float32") / 255.0)
+        y = np.clip(y, 0.0, 1.0)
+        y = (y > 0.5).astype("float32").transpose(2, 0, 1)
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
@@ -370,6 +399,7 @@ class HAREnsemble(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 3, 1),
         )
+        self._printed_debug = False
 
     def _align(self, pred: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         if pred.shape[2:] != ref.shape[2:]:
@@ -382,8 +412,12 @@ class HAREnsemble(nn.Module):
             p2 = self.wdff(x)
             p3 = self.transfuse(x)
 
-        p2 = self._align(p2, p1)
-        p3 = self._align(p3, p1)
+        p1 = self._align(p1, x)
+        p2 = self._align(p2, x)
+        p3 = self._align(p3, x)
+        if not self._printed_debug:
+            print(f"[HAR] Shapes -> p1:{tuple(p1.shape)} p2:{tuple(p2.shape)} p3:{tuple(p3.shape)}")
+            self._printed_debug = True
 
         stack = torch.cat([p1, p2, p3], dim=1)
         stack = self.attn(stack)
@@ -410,19 +444,21 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float
     tp = ((pred_f == 1) & (tar_f == 1)).sum().item()
     fp = ((pred_f == 1) & (tar_f == 0)).sum().item()
     fn = ((pred_f == 0) & (tar_f == 1)).sum().item()
+    tn = ((pred_f == 0) & (tar_f == 0)).sum().item()
 
     dice = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
     iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
     precision = (tp + 1e-6) / (tp + fp + 1e-6)
     recall = (tp + 1e-6) / (tp + fn + 1e-6)
     f1 = (2 * precision * recall + 1e-6) / (precision + recall + 1e-6)
-    return {"Dice": dice, "IoU": iou, "Precision": precision, "Recall": recall, "F1": f1}
+    acc = (tp + tn + 1e-6) / (tp + tn + fp + fn + 1e-6)
+    return {"Dice": dice, "IoU": iou, "Accuracy": acc, "Precision": precision, "Recall": recall, "F1": f1}
 
 
 @torch.no_grad()
 def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
-    agg = {"Dice": [], "IoU": [], "Precision": [], "Recall": [], "F1": []}
+    agg = {"Dice": [], "IoU": [], "Accuracy": [], "Precision": [], "Recall": [], "F1": []}
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         p = model(x)
@@ -444,8 +480,17 @@ class TrainConfig:
     lr: float = 1e-3
 
 
+def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    pred_f = pred.reshape(pred.shape[0], -1)
+    target_f = target.reshape(target.shape[0], -1)
+    inter = (pred_f * target_f).sum(dim=1)
+    union = pred_f.sum(dim=1) + target_f.sum(dim=1)
+    dice = (2 * inter + eps) / (union + eps)
+    return 1 - dice.mean()
+
+
 def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfig):
-    criterion = nn.BCELoss()
+    criterion_bce = nn.BCELoss()
     optimizer = torch.optim.Adam(
         list(model.attn.parameters()) + list(model.weight_head.parameters()),
         lr=cfg.lr,
@@ -463,7 +508,9 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
                 p = model(x)
                 if p.shape[2:] != y.shape[2:]:
                     p = F.interpolate(p, size=y.shape[2:], mode="bilinear", align_corners=False)
-                loss = criterion(p, y)
+                loss_bce = criterion_bce(p, y)
+                loss_dice = dice_loss(p, y)
+                loss = 0.5 * loss_bce + 0.5 * loss_dice
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -537,7 +584,7 @@ def mount_drive_if_needed() -> None:
         drive.mount("/content/drive")
 
 
-def run_from_env() -> None:
+def run_full_pipeline() -> None:
     """
     Execute full HAR pipeline using environment variables.
 
@@ -582,7 +629,7 @@ def run_from_env() -> None:
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
     resunetpp = ResUnetPPBuilder().to(DEVICE)
     wdffnet = WDFFNet(pretrained=False, num_classes=1).to(DEVICE)
-    transfuse = TransFuseSimple(num_classes=1, pretrained=False).to(DEVICE)
+    transfuse = TransFuseSimple(num_classes=1, pretrained=False, transfuse_input_size=224).to(DEVICE)
 
     load_partial_state_dict(resunetpp, resunet_ckpt, DEVICE)
     load_partial_state_dict(wdffnet, wdff_ckpt or "", DEVICE)
@@ -607,14 +654,21 @@ def run_from_env() -> None:
     rows = []
     for name, mdl in base_wrappers.items():
         m = evaluate_model(mdl, val_loader, DEVICE)
-        rows.append([name, m["Dice"], m["IoU"], m["Precision"], m["Recall"], m["F1"]])
+        rows.append([name, m["Dice"], m["IoU"], m["Accuracy"], m["Precision"], m["Recall"], m["F1"]])
 
-    print(tabulate(rows, headers=["Model", "Dice", "IoU", "Precision", "Recall", "F1"], floatfmt=".4f", tablefmt="github"))
+    print(
+        tabulate(
+            rows,
+            headers=["Model", "Dice", "IoU", "Accuracy", "Precision", "Recall", "F1"],
+            floatfmt=".4f",
+            tablefmt="github",
+        )
+    )
 
 
 if __name__ == "__main__":
     try:
-        run_from_env()
+        run_full_pipeline()
     except Exception as exc:
         print(f"[INFO] End-to-end run skipped: {exc}")
         print(
