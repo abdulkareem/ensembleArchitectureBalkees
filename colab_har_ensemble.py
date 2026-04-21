@@ -14,6 +14,7 @@ import os
 import random
 import subprocess
 import importlib.util
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -510,3 +511,118 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
 #
 # print(tabulate(rows, headers=["Model", "Dice", "IoU", "Precision", "Recall", "F1"], floatfmt=".4f", tablefmt="github"))
 
+
+def _env_path(name: str) -> Optional[str]:
+    raw = os.environ.get(name, "").strip()
+    return raw if raw else None
+
+
+def _must_exist(path: Optional[str], label: str) -> Optional[str]:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
+def mount_drive_if_needed() -> None:
+    """Mount Google Drive only when running inside Colab and not already mounted."""
+    in_colab = importlib.util.find_spec("google.colab") is not None
+    drive_root = Path("/content/drive/MyDrive")
+    if drive_root.exists():
+        return
+    if in_colab:
+        from google.colab import drive  # type: ignore
+
+        drive.mount("/content/drive")
+
+
+def run_from_env() -> None:
+    """
+    Execute full HAR pipeline using environment variables.
+
+    Required:
+      DATA_DIR, RESUNET_REPO, RESUNET_CKPT, TRANSFUSE_CKPT
+    Optional:
+      WDFF_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, NUM_WORKERS
+    """
+    mount_drive_if_needed()
+
+    data_dir = _must_exist(_env_path("DATA_DIR"), "DATA_DIR")
+    resunet_repo = _must_exist(_env_path("RESUNET_REPO"), "RESUNET_REPO")
+    resunet_ckpt = _must_exist(_env_path("RESUNET_CKPT"), "RESUNET_CKPT")
+    transfuse_ckpt = _must_exist(_env_path("TRANSFUSE_CKPT"), "TRANSFUSE_CKPT")
+    wdff_ckpt = _env_path("WDFF_CKPT")
+    if wdff_ckpt and not os.path.exists(wdff_ckpt):
+        print(f"[WARN] WDFF_CKPT not found: {wdff_ckpt}. WDFFNet will run with random weights.")
+        wdff_ckpt = None
+
+    missing = [
+        name
+        for name, value in [
+            ("DATA_DIR", data_dir),
+            ("RESUNET_REPO", resunet_repo),
+            ("RESUNET_CKPT", resunet_ckpt),
+            ("TRANSFUSE_CKPT", transfuse_ckpt),
+        ]
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            "Missing required environment variables: "
+            + ", ".join(missing)
+            + ".\nSet them before running `%run colab_har_ensemble.py`."
+        )
+
+    epochs = int(os.environ.get("EPOCHS", "12"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "8"))
+    img_size = int(os.environ.get("IMG_SIZE", "352"))
+    num_workers = int(os.environ.get("NUM_WORKERS", "2"))
+
+    ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
+    resunetpp = ResUnetPPBuilder().to(DEVICE)
+    wdffnet = WDFFNet(pretrained=False, num_classes=1).to(DEVICE)
+    transfuse = TransFuseSimple(num_classes=1, pretrained=False).to(DEVICE)
+
+    load_partial_state_dict(resunetpp, resunet_ckpt, DEVICE)
+    load_partial_state_dict(wdffnet, wdff_ckpt or "", DEVICE)
+    load_partial_state_dict(transfuse, transfuse_ckpt, DEVICE)
+
+    train_loader, val_loader = make_loaders(
+        data_dir,
+        size=img_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+    har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
+    train_har_head(har, train_loader, TrainConfig(epochs=epochs, lr=1e-3))
+
+    base_wrappers = {
+        "ResUNet++": resunetpp,
+        "WDFFNet": wdffnet,
+        "TransFuse": transfuse,
+        "HAR Ensemble": har,
+    }
+
+    rows = []
+    for name, mdl in base_wrappers.items():
+        m = evaluate_model(mdl, val_loader, DEVICE)
+        rows.append([name, m["Dice"], m["IoU"], m["Precision"], m["Recall"], m["F1"]])
+
+    print(tabulate(rows, headers=["Model", "Dice", "IoU", "Precision", "Recall", "F1"], floatfmt=".4f", tablefmt="github"))
+
+
+if __name__ == "__main__":
+    try:
+        run_from_env()
+    except Exception as exc:
+        print(f"[INFO] End-to-end run skipped: {exc}")
+        print(
+            "[INFO] To run in Colab, set env vars first:\n"
+            "  %env DATA_DIR=/content/data/Kvasir-SEG\n"
+            "  %env RESUNET_REPO=/content/ResUNetPlusPlus\n"
+            "  %env RESUNET_CKPT=/content/drive/MyDrive/.../best_resunetpp_model.pth\n"
+            "  %env WDFF_CKPT=/content/drive/MyDrive/.../best_wdffnet.pth\n"
+            "  %env TRANSFUSE_CKPT=/content/drive/MyDrive/.../best_transfuse_model.pth\n"
+            "  %run colab_har_ensemble.py"
+        )
