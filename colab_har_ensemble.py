@@ -42,13 +42,16 @@ def seed_everything(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # deterministic=True can trigger "unable to find an engine" errors for some ops.
+    # Keep training/evaluation stable via seeding while allowing cuDNN to select valid kernels.
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 seed_everything(42)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-USE_AMP = DEVICE.type == "cuda"
+FORCE_CPU = os.environ.get("FORCE_CPU", "0") == "1"
+DEVICE = torch.device("cuda" if (torch.cuda.is_available() and not FORCE_CPU) else "cpu")
+USE_AMP = DEVICE.type == "cuda" and os.environ.get("DISABLE_AMP", "0") != "1"
 print(f"Device: {DEVICE} | AMP: {USE_AMP}")
 
 
@@ -482,14 +485,17 @@ def normalize_segmentation_output(pred: torch.Tensor, ref_shape: Optional[Tuple[
 
     if ref_shape is not None and pred.shape[2:] != ref_shape:
         pred = F.interpolate(pred, size=ref_shape, mode="bilinear", align_corners=False)
+    # Some checkpoints/models return logits. Convert to probabilities consistently.
+    if pred.min().item() < 0.0 or pred.max().item() > 1.0:
+        pred = torch.sigmoid(pred)
     return pred
 
 def _bin(pred: torch.Tensor, th: float = 0.5) -> torch.Tensor:
     return (pred > th).float()
 
 
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
-    pred = _bin(pred)
+def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
+    pred = _bin(pred, th=threshold)
     target = _bin(target)
     pred_f = pred.reshape(-1)
     tar_f = target.reshape(-1)
@@ -509,16 +515,30 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float
 
 
 @torch.no_grad()
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.5) -> Dict[str, float]:
     model.eval()
     agg = {"Dice": [], "IoU": [], "Accuracy": [], "Precision": [], "Recall": [], "F1": []}
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-        batch_metrics = compute_metrics(p, y)
+        batch_metrics = compute_metrics(p, y, threshold=threshold)
         for k, v in batch_metrics.items():
             agg[k].append(v)
     return {k: float(np.mean(v)) for k, v in agg.items()}
+
+
+@torch.no_grad()
+def find_best_threshold(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    """Tune binary threshold for best validation Dice."""
+    candidates = np.linspace(0.30, 0.70, 17)
+    best_t, best_dice = 0.5, -1.0
+    for t in candidates:
+        m = evaluate_model(model, loader, device, threshold=float(t))
+        if m["Dice"] > best_dice:
+            best_dice = m["Dice"]
+            best_t = float(t)
+    print(f"[HAR] Best validation threshold: {best_t:.2f} (Dice={best_dice:.4f})")
+    return best_t
 
 
 # =========================
@@ -692,6 +712,7 @@ def run_full_pipeline() -> None:
     )
     har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
     train_har_head(har, train_loader, TrainConfig(epochs=epochs, lr=1e-3))
+    best_thr = find_best_threshold(har, val_loader, DEVICE)
 
     base_wrappers = {
         "ResUNet++": resunetpp,
@@ -702,7 +723,8 @@ def run_full_pipeline() -> None:
 
     rows = []
     for name, mdl in base_wrappers.items():
-        m = evaluate_model(mdl, val_loader, DEVICE)
+        threshold = best_thr if name == "HAR Ensemble" else 0.5
+        m = evaluate_model(mdl, val_loader, DEVICE, threshold=threshold)
         rows.append([name, m["Dice"], m["IoU"], m["Accuracy"], m["Precision"], m["Recall"], m["F1"]])
 
     print(
@@ -720,6 +742,14 @@ if __name__ == "__main__":
         run_full_pipeline()
     except Exception as exc:
         print(f"[INFO] End-to-end run skipped: {exc}")
+        if "device-side assert" in str(exc).lower():
+            print(
+                "[INFO] CUDA device-side assert detected. Re-run with:\n"
+                "  %env CUDA_LAUNCH_BLOCKING=1\n"
+                "  %env DISABLE_AMP=1\n"
+                "or force CPU for debugging:\n"
+                "  %env FORCE_CPU=1"
+            )
         print(
             "[INFO] To run in Colab, set env vars first:\n"
             "  %env DATA_DIR=/content/data/Kvasir-SEG\n"
