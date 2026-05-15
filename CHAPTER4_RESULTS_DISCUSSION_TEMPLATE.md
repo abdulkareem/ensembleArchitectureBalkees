@@ -117,28 +117,58 @@ Add a short per-failure-case analysis and mention whether ensemble mitigates or 
 
 From a practical standpoint, the system’s Dice of **[XX.XX]** and Recall of **[XX.XX]** suggest strong lesion-capture behavior. However, deployment in real-world endoscopy pipelines requires external validation on multi-center data and robustness testing under device/domain shift.
 
-## 4.7 Ablation Study Template (Optional but Recommended)
+## 4.7 Ablation Analysis
 
-### 4.7.1 Impact of Standardized Preprocessing
+This section should be included in the final chapter to respond directly to reviewer feedback. The aim of the ablation analysis is to isolate the contribution of each major design choice rather than only reporting the final ensemble score. Each ablation should be evaluated on the same held-out test split, using the same thresholding rule and metric implementation as the main experiments.
 
-| Setting                               | Dice | IoU |
-|---------------------------------------|------|-----|
-| Non-unified preprocessing             | [ ]  | [ ] |
-| Unified preprocessing (proposed)      | [ ]  | [ ] |
+### 4.7.1 Effect of Standardized Preprocessing
 
-### 4.7.2 Ensemble Strategy Comparison
+The first ablation evaluates whether performance changes are caused by the proposed architecture/ensemble design or by inconsistent data handling. The non-unified setting represents model-specific preprocessing pipelines, while the unified setting applies the same 256×256 resize, ImageNet normalization, mask scaling, and mask binarization to all models.
 
-| Ensemble Type                         | Dice | IoU |
-|--------------------------------------|------|-----|
-| Simple average (r+t+w)/3             | [ ]  | [ ] |
-| Learnable weighted ensemble (proposed)| [ ] | [ ] |
+| Setting                          | Dice | IoU | Precision | Recall | Accuracy |
+|----------------------------------|------|-----|-----------|--------|----------|
+| Non-unified preprocessing        | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| Unified preprocessing (proposed) | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
 
-### 4.7.3 Checkpoint Loading Strategy
+**Analysis to report:** If the unified setting improves Dice/IoU or reduces metric variance, this supports the claim that preprocessing standardization is necessary for fair comparison. If the difference is small, it still validates that subsequent gains are not an artefact of data-pipeline mismatch.
 
-| Loading Strategy                      | Dice | Notes |
-|---------------------------------------|------|-------|
-| Strict load only                      | [ ]  | [ ]   |
-| Shape-safe partial load (proposed)    | [ ]  | [ ]   |
+### 4.7.2 Contribution of Individual Base Models
+
+This ablation reports each backbone independently before fusion. It demonstrates whether the ensemble benefit comes from complementary behavior among ResUNet++, TransFuse, and WDFFNet rather than from a single dominant model.
+
+| Model     | Dice | IoU | Precision | Recall | Accuracy |
+|-----------|------|-----|-----------|--------|----------|
+| ResUNet++ | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| TransFuse | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| WDFFNet   | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+
+**Analysis to report:** Discuss which model has the strongest overlap score, which model has the strongest Recall, and whether any model shows a Precision/Recall imbalance. This helps explain why adaptive fusion may improve robustness across heterogeneous cases.
+
+### 4.7.3 Ensemble Fusion Strategy
+
+The third ablation compares the proposed learnable weighted ensemble with a non-learned baseline. The simple-average baseline computes the arithmetic mean of the three base predictions, while the proposed method learns spatially adaptive softmax weights for the base predictions.
+
+| Ensemble Type                          | Dice | IoU | Precision | Recall | Accuracy |
+|----------------------------------------|------|-----|-----------|--------|----------|
+| Simple average `(r + t + w) / 3`       | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| Learnable weighted ensemble (proposed) | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+
+**Analysis to report:** Improvement over simple averaging indicates that the ensemble head is learning meaningful model-specific contributions instead of only smoothing predictions. If the gains are concentrated in Recall, emphasize improved lesion coverage; if concentrated in Precision, emphasize reduced false-positive mucosal regions.
+
+### 4.7.4 Checkpoint Loading and Shape Normalization
+
+This ablation verifies the engineering controls used to make heterogeneous architectures comparable. Strict loading uses only checkpoints that exactly match the instantiated architecture. The proposed shape-safe strategy loads compatible tensors, skips incompatible tensors, and normalizes prediction tensors to a common binary BCHW format.
+
+| Loading Strategy                   | Dice | IoU | Notes |
+|------------------------------------|------|-----|-------|
+| Strict checkpoint loading          | [ ]  | [ ] | [ ]   |
+| Shape-safe partial load (proposed) | [ ]  | [ ] | [ ]   |
+
+**Analysis to report:** The proposed loading strategy should not be presented as a way to inflate performance; instead, it is an engineering reliability control that prevents failed runs and silent tensor-shape errors when reproducing experiments.
+
+### 4.7.5 Recommended Ablation Summary Paragraph
+
+> The ablation study confirms that the final performance is not attributable to a single implementation choice. Standardized preprocessing establishes a fair basis for comparison, individual-model results show complementary strengths across ResUNet++, TransFuse, and WDFFNet, and the learnable weighted ensemble improves over simple averaging by adaptively weighting model predictions. The checkpoint-loading ablation further demonstrates that the reported pipeline is reproducible and robust to architecture-specific output and checkpoint mismatches.
 
 ## 4.8 Threats to Validity
 
