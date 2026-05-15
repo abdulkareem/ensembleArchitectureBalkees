@@ -187,7 +187,63 @@ These controls reduce experimental variance and prevent silent shape/configurati
 
 ---
 
-## 8. Suggested Dissertation Results Table Template
+
+## 8. Ablation Analysis
+
+The ablation analysis isolates the contribution of the most important methodological decisions in the proposed segmentation framework. All ablation experiments should use the same Kvasir-SEG split, the same 256×256 evaluation resolution, the same metric definitions, and the same post-processing threshold as the main comparison. This ensures that each reported change reflects the removed or replaced component rather than changes in evaluation protocol.
+
+### 8.1 Preprocessing Standardization
+
+This ablation compares a non-unified preprocessing setup against the proposed unified pipeline. The unified setup applies identical resizing, ImageNet normalization, mask scaling, and binary thresholding to ResUNet++, TransFuse, WDFFNet, and the ensemble.
+
+| Setting                          | Dice | IoU | Precision | Recall | Accuracy |
+|----------------------------------|------|-----|-----------|--------|----------|
+| Non-unified preprocessing        | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| Unified preprocessing (proposed) | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+
+**Interpretation:** This ablation demonstrates whether fair data handling improves model comparability. A gain in Dice and IoU under the unified protocol would indicate that preprocessing consistency reduces avoidable variance. If the scores remain similar, the result still supports the validity of the remaining experiments by showing that the proposed gains are not caused by hidden data-pipeline differences.
+
+### 8.2 Base-Model Contribution
+
+Each base model is evaluated independently before fusion. This establishes a baseline for the ensemble and identifies the unique behavior of each architecture.
+
+| Model     | Dice | IoU | Precision | Recall | Accuracy |
+|-----------|------|-----|-----------|--------|----------|
+| ResUNet++ | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| TransFuse | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| WDFFNet   | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+
+**Interpretation:** ResUNet++ is expected to contribute boundary-sensitive local structure, TransFuse contributes broader semantic context through its dual stream, and WDFFNet contributes feature diversity through dual-backbone weighted fusion and attention. Reporting these models independently shows whether the ensemble is combining genuinely complementary predictors.
+
+### 8.3 Fusion Strategy
+
+This ablation compares the proposed learnable weighted ensemble with a simple non-learned average of the same base-model predictions.
+
+| Fusion Strategy                        | Dice | IoU | Precision | Recall | Accuracy |
+|----------------------------------------|------|-----|-----------|--------|----------|
+| Simple average `(r + t + w) / 3`       | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+| Learnable weighted ensemble (proposed) | [ ]  | [ ] | [ ]       | [ ]    | [ ]      |
+
+**Interpretation:** If the learnable ensemble outperforms simple averaging, the result supports the claim that spatially adaptive weighting is more effective than treating all base models as equally reliable for every pixel and image. Improvements in Recall should be discussed as better lesion coverage, while improvements in Precision should be discussed as better suppression of false-positive mucosal regions.
+
+### 8.4 Checkpoint Loading and Output Normalization
+
+Because the framework combines heterogeneous architectures, this ablation documents the effect of the engineering safeguards used for reproducible evaluation.
+
+| Strategy                           | Dice | IoU | Notes |
+|------------------------------------|------|-----|-------|
+| Strict checkpoint loading          | [ ]  | [ ] | [ ]   |
+| Shape-safe partial load (proposed) | [ ]  | [ ] | [ ]   |
+
+**Interpretation:** Shape-safe partial loading and output normalization should be described as reliability controls rather than as performance-enhancing tricks. They allow compatible learned weights to be reused while preventing shape mismatches and inconsistent output formats from invalidating the comparison.
+
+### 8.5 Ablation Conclusion
+
+Overall, the ablation study should show that the final system benefits from three separable factors: a standardized evaluation protocol, complementary base architectures, and a learnable adaptive fusion mechanism. This strengthens the dissertation by demonstrating that the proposed ensemble improvement is not merely a consequence of implementation details or a single high-performing base model.
+
+---
+
+## 9. Suggested Dissertation Results Table Template
 
 | Model     | Dice | IoU | Precision | Recall | Accuracy | Params | Trainable Params | FPS |
 |-----------|------|-----|-----------|--------|----------|--------|------------------|-----|
@@ -198,7 +254,7 @@ These controls reduce experimental variance and prevent silent shape/configurati
 
 ---
 
-## 9. Suggested Dissertation Figures
+## 10. Suggested Dissertation Figures
 
 1. **Pipeline overview**: data flow from preprocessing → three base models → ensemble head.
 2. **Model architecture diagrams**:
@@ -211,7 +267,7 @@ These controls reduce experimental variance and prevent silent shape/configurati
 
 ---
 
-## 10. Discussion Points for PhD Writing
+## 11. Discussion Points for PhD Writing
 
 1. **Why standardization matters**: architecture-level gains are obscured when preprocessing differs.
 2. **Error modes**: small-flat polyps, specular highlights, blurred boundaries, stool artifacts.
@@ -225,13 +281,13 @@ These controls reduce experimental variance and prevent silent shape/configurati
 
 ---
 
-## 11. Example Methodology Paragraph (Ready to paste)
+## 12. Example Methodology Paragraph (Ready to paste)
 
 > We implemented a unified segmentation framework in PyTorch for Kvasir-SEG using ResUNet++, TransFuse, and WDFFNet under identical preprocessing conditions (256×256 resize and ImageNet normalization). Each model was trained independently with a balanced Dice-BCE objective and Adam optimization (1e-4), selecting checkpoints by best validation Dice. To leverage model complementarity, we introduced a learnable weighted ensemble that freezes base networks and estimates adaptive per-pixel fusion weights via a lightweight softmax head. Evaluation was performed on a held-out test split using Dice, IoU, Precision, Recall, and Accuracy, supplemented with computational profiling (parameter counts and FPS). This design ensures architectural fairness, reproducibility, and robust comparative analysis for medical image segmentation.
 
 ---
 
-## 12. Example Contributions List (Ready to paste)
+## 13. Example Contributions List (Ready to paste)
 
 1. A fully standardized training/evaluation protocol for three heterogeneous segmentation models on Kvasir-SEG.
 2. Practical resolution of architecture-checkpoint mismatches through robust, shape-safe partial weight loading.
